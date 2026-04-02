@@ -1,0 +1,54 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;
+    float invMass;
+    vec3 vel;
+    float padding;
+    vec3 pos_n;
+    float padding2;
+    vec3 vel_n;
+    float padding3;
+    vec4 normal;
+};
+
+struct R {
+    vec3 r;
+    float padding;
+};
+
+struct P {
+    vec3 p;
+    float padding;
+};
+
+struct CGResult {
+    float r_dot_r_old;
+    float r_dot_r_new;
+    float alpha;
+    float beta;
+};
+// ==========================================
+// 2. 버퍼 바인딩
+// ==========================================
+layout(std430, binding = 0) readonly buffer PhysicsIn { PhysicsVertex physData[]; };
+layout(std430, binding = 4) readonly buffer RBuffer { R rs[]; };
+layout(std430, binding = 5) buffer PBuffer  { P ps[]; };
+layout(std430, binding = 11) buffer CGResultBuffer { CGResult result; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx < physData.length()){
+        float invM = physData[idx].invMass;
+        if (invM > 0.0) {
+            ps[idx].p = rs[idx].r + result.beta * ps[idx].p;
+        }
+    }
+}

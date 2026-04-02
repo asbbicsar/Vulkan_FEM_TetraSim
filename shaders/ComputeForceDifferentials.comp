@@ -1,0 +1,133 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;
+    float invMass;
+    vec3 vel;
+    float padding;
+    vec3 pos_n;
+    float padding2;
+    vec3 vel_n;
+    float padding3;
+    vec4 normal;
+};
+
+struct Tetrahedron {
+    uvec4 indices;
+    float invDm[9];
+    float restVolume;
+    vec2 padding;
+};
+
+struct P {
+    vec3 p;
+    float padding;
+};
+
+struct DF {
+    vec3 df;
+    float padding;
+};
+
+// ==========================================
+// 2. 버퍼 바인딩
+// ==========================================
+layout(std430, binding = 0) readonly buffer PhysicsIn { PhysicsVertex physData[]; };
+layout(std430, binding = 2) readonly buffer TetraBuffer { Tetrahedron tetras[]; };
+layout(std430, binding = 5) readonly buffer PBuffer  { P ps[]; };  // CG의 탐색 방향 벡터 (수식의 delta_x)
+layout(std430, binding = 7) buffer DfBuffer { DF dfs[]; }; // 계산된 힘 미분 결과 (delta_f) 저장
+
+// ==========================================
+// 3. 재질 상수 (Push Constant나 UBO로 빼는 것을 권장)
+// ==========================================
+layout(push_constant) uniform PushConstants {
+    float dt;
+    float u_Time;
+    uint numWorkGroupsFromPreviousPass;
+    float youngsModulus;
+    float poissonsRatio;
+    uint colorOffset;
+    uint colorCount;
+} pc;
+
+void main() {
+    float mu = pc.youngsModulus / (2.0 * (1.0 + pc.poissonsRatio));
+    float lambda = (pc.youngsModulus * pc.poissonsRatio) / ((1.0 + pc.poissonsRatio) * (1.0 - 2.0 * pc.poissonsRatio));
+
+    if (gl_GlobalInvocationID.x >= pc.colorCount) return;
+    uint tIdx = gl_GlobalInvocationID.x + pc.colorOffset;
+
+    Tetrahedron tet = tetras[tIdx];
+
+    // 1. 인덱스 추출
+    uint i0 = tet.indices.x;
+    uint i1 = tet.indices.y;
+    uint i2 = tet.indices.z;
+    uint i3 = tet.indices.w;
+
+    // 2. 현재 위치 (x) 및 변위/방향 벡터 (dx, 즉 p) 로드
+    vec3 x0 = physData[i0].pos; vec3 p0 = ps[i0].p;
+    vec3 x1 = physData[i1].pos; vec3 p1 = ps[i1].p;
+    vec3 x2 = physData[i2].pos; vec3 p2 = ps[i2].p;
+    vec3 x3 = physData[i3].pos; vec3 p3 = ps[i3].p;
+
+    // 3. 변형 및 변위 형상 행렬 (Ds, dDs) [cite: 627]
+    mat3 Ds  = mat3(x1 - x0, x2 - x0, x3 - x0);
+    mat3 dDs = mat3(p1 - p0, p2 - p0, p3 - p0);
+
+    // 4. 역행렬 (Dm^-1) 복구
+    mat3 invDm = mat3(
+        tet.invDm[0], tet.invDm[1], tet.invDm[2],
+        tet.invDm[3], tet.invDm[4], tet.invDm[5],
+        tet.invDm[6], tet.invDm[7], tet.invDm[8]
+    );
+
+    // 5. F 및 dF (Deformation Gradient & Differential) 계산 [cite: 628, 629]
+    mat3 F  = Ds * invDm;
+    mat3 dF = dDs * invDm;
+
+    // 6. 응력 미분 (dP) - Neo-Hookean 모델 적용 
+    float J = determinant(F);
+    if (isnan(J) || isinf(J) || J < 0.0001) {
+        F[0][0] += 0.001;
+        F[1][1] += 0.001;
+        F[2][2] += 0.001;
+        J = determinant(F);
+    }
+    float J_safe = max(J, 0.001);
+
+    mat3 invF = inverse(F);
+    mat3 invFT = transpose(invF);
+    mat3 dFT = transpose(dF);
+
+    // tr(F^-1 * dF) 계산
+    mat3 invF_dF = invF * dF;
+    float tr = invF_dF[0][0] + invF_dF[1][1] + invF_dF[2][2];
+
+    // Neo-Hookean dP 공식: mu * dF + (mu - lambda * log(J)) * F^-T * dF^T * F^-T + lambda * tr(F^-1 * dF) * F^-T 
+    mat3 term2 = invFT * dFT * invFT;
+    mat3 dP = mu * dF 
+            + (mu - lambda * log(J_safe)) * term2 
+            + (lambda * tr) * invFT;
+
+    // 7. 정점 힘 미분 행렬 (dH) 계산 [cite: 630]
+    mat3 dH = -tet.restVolume * dP * transpose(invDm);
+
+    // 8. 각 정점별 힘 추출 [cite: 642, 643]
+    vec3 df1 = dH[0];
+    vec3 df2 = dH[1];
+    vec3 df3 = dH[2];
+    vec3 df0 = -(df1 + df2 + df3);
+
+    // 9. 결과 누적 (그래프 컬러링을 통해 스레드 충돌이 없으므로 += 사용 가능)
+    dfs[i0].df += df0;
+    dfs[i1].df += df1;
+    dfs[i2].df += df2;
+    dfs[i3].df += df3;
+}

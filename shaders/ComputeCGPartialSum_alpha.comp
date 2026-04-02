@@ -1,0 +1,123 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;
+    float invMass;
+    vec3 vel;
+    float padding;
+    vec3 pos_n;
+    float padding2;
+    vec3 vel_n;
+    float padding3;
+    vec4 normal;
+};
+
+struct Tetrahedron {
+    uvec4 indices;
+    float invDm[9];
+    float restVolume;
+    vec2 padding;
+};
+
+struct R {
+    vec3 r;
+    float padding;
+};
+
+struct P {
+    vec3 p;
+    float padding;
+};
+
+struct DF {
+    vec3 df;
+    float padding;
+};
+
+struct Q {
+    vec3 q;
+    float padding;
+};
+// ==========================================
+// 2. 버퍼 바인딩
+// ==========================================
+layout(std430, binding = 0) readonly buffer PhysicsIn { PhysicsVertex physData[]; };
+layout(std430, binding = 2) readonly buffer TetraBuffer { Tetrahedron tetras[]; };
+layout(std430, binding = 4) readonly buffer RBuffer { R rs[]; };
+layout(std430, binding = 5) readonly buffer PBuffer  { P ps[]; };  // CG의 탐색 방향 벡터 (수식의 delta_x)
+layout(std430, binding = 7) buffer DfBuffer { DF dfs[]; }; // 계산된 힘 미분 결과 (delta_f) 저장
+layout(std430, binding = 8) buffer QBuffer { Q qs[];  };
+layout(std430, binding = 9) buffer AlphaNumerSumBuffer { float numerSums[]; };
+layout(std430, binding = 10) buffer AlphaDenomSumBuffer { float denomSums[]; };
+
+layout(push_constant) uniform PushConstants {
+    float dt;
+    float u_Time;
+    uint numWorkGroupsFromPreviousPass;
+    float youngsModulus;
+    float poissonsRatio;
+    uint colorOffset;
+    uint colorCount;
+} pc;
+
+shared float sharedNumer[64];
+shared float sharedDenom[64];
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+    sharedNumer[tid] = 0.0;
+    sharedDenom[tid] = 0.0;
+
+    if (idx < physData.length()){
+        float invMass = physData[idx].invMass;
+        if (invMass > 0.0) {
+            float dt = pc.dt;
+            //float gamma = 0.98;
+            float gamma = 0.125;
+
+            vec3 Kp = -(dfs[idx].df);
+            
+            float floorY = -1.5;
+            float penaltyK = 50000.0;
+            if (physData[idx].pos.y < floorY) {
+                Kp.y += penaltyK * ps[idx].p.y;
+            }
+            
+            vec3 p = ps[idx].p;
+            //Kp = vec3(0.0);
+            //p = vec3(0.0);
+            float mass = 1.0 / invMass;
+
+            vec3 term1_Kp = (1.0 + gamma / dt) * Kp;
+            vec3 term2_Mp = (1.0 / (dt * dt)) * mass * p;
+            vec3 q = term1_Kp + term2_Mp;
+            qs[idx].q = q;
+
+            sharedNumer[tid] = dot(rs[idx].r, rs[idx].r);
+            sharedDenom[tid] = dot(ps[idx].p, q);
+        } else {
+            sharedNumer[tid] = 0.0;
+            sharedDenom[tid] = 0.0;
+        }
+    }
+    barrier();
+    
+    for (uint s = 64 / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sharedNumer[tid] += sharedNumer[tid + s];
+            sharedDenom[tid] += sharedDenom[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        numerSums[gl_WorkGroupID.x] = sharedNumer[0];
+        denomSums[gl_WorkGroupID.x] = sharedDenom[0];
+    }
+}

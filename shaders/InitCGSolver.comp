@@ -1,0 +1,111 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의 (C++과 완벽히 일치)
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;
+    float invMass;
+    vec3 vel;
+    float padding;
+    vec3 pos_n;
+    float padding2;
+    vec3 vel_n;
+    float padding3;
+    vec4 normal;
+};
+
+struct Tetrahedron {
+    uvec4 indices;   // 정점 인덱스 4개
+    float invDm[9];  // 3x3 역행렬 (1차원 배열로 패킹)
+    float restVolume;// 원래 부피
+    vec2 padding;
+};
+
+struct Force {
+    vec3 force;
+    float padding;
+};
+
+struct R {
+    vec3 r;
+    float padding;
+};
+
+struct P {
+    vec3 p;
+    float padding;
+};
+
+struct DX {
+    vec3 dx;
+    float padding;
+};
+
+// ==========================================
+// 2. 버퍼 바인딩 (createComputeDescriptorSets에 맞춤)
+// ==========================================
+layout(std430, binding = 0) readonly buffer PhysicsIn { PhysicsVertex physData[]; };
+layout(std430, binding = 2) readonly buffer TetraBuffer { Tetrahedron tetras[]; };
+layout(std430, binding = 3) buffer ForceBuffer { Force forces[]; }; // 읽기/쓰기 모두 필요
+layout(std430, binding = 4) buffer RBuffer { R rs[]; };
+layout(std430, binding = 5) buffer PBuffer { P ps[]; };
+layout(std430, binding = 6) buffer DXBuffer { DX dxs[]; };
+
+layout(push_constant) uniform PushConstants {
+    float dt;
+    float u_Time;
+    uint numWorkGroupsFromPreviousPass;
+    float youngsModulus;
+    float poissonsRatio;
+    uint colorOffset;
+    uint colorCount;
+} pc;
+
+void main() {
+    float dt = pc.dt;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= physData.length()) return;
+
+    float invM = physData[idx].invMass;
+    vec3 force = forces[idx].force;
+
+    if(invM <= 1e-8) {
+        rs[idx].r = vec3(0.0);
+        ps[idx].p = vec3(0.0);
+        dxs[idx].dx = vec3(0.0);
+        return;
+    }
+
+    // 2. 질량 복구
+    float mass = 1.0 / invM;
+
+    // 3. 속도 데이터 가져오기
+    vec3 v_n = physData[idx].vel_n; // 프레임 시작 시점의 속도 (v^n)
+    vec3 v_k = (physData[idx].pos - physData[idx].pos_n) / dt;
+
+    // 4. 힘 가져오기 (ComputeElasticForce에서 구한 값)
+    vec3 gravity = vec3(0.0, -9.8, 0.0);
+    vec3 f_ext = gravity * mass; // 외력: 중력 가속도 곱하기 질량
+    //vec3 f_ext = gravity;
+    float floorY = -1.5;
+    float penaltyK = 50000.0; // 바닥의 강성 (필요시 조절)
+    if (physData[idx].pos.y < floorY) {
+        f_ext.y += penaltyK * (floorY - physData[idx].pos.y);
+    }
+
+    vec3 f_e = force + f_ext;
+
+    // 5. 우변 벡터(b) 계산: 관성력 + 탄성력
+    // 수식: (1/dt) * M * (v^n - v_k) + f_e
+    vec3 inertia = (mass / dt) * (v_n - v_k);
+    vec3 b = f_e + inertia;
+    //b = vec3(0.0);
+    
+    rs[idx].r = b;
+    ps[idx].p = b;
+    dxs[idx].dx = vec3(0.0);
+}

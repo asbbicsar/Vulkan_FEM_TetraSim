@@ -1,0 +1,115 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의 (C++과 완벽히 일치)
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;
+    float invMass;
+    vec3 vel;
+    float padding;
+    vec3 pos_n;
+    float padding2;
+    vec3 vel_n;
+    float padding3;
+    vec4 normal;
+};
+
+struct Tetrahedron {
+    uvec4 indices;   // 정점 인덱스 4개
+    float invDm[9];  // 3x3 역행렬 (1차원 배열로 패킹)
+    float restVolume;// 원래 부피
+    vec2 padding;
+};
+
+struct Force {
+    vec3 force;
+    float padding;
+};
+
+// ==========================================
+// 2. 버퍼 바인딩 (createComputeDescriptorSets에 맞춤)
+// ==========================================
+layout(std430, binding = 0) readonly buffer PhysicsIn { PhysicsVertex physData[]; };
+layout(std430, binding = 2) readonly buffer TetraBuffer { Tetrahedron tetras[]; };
+layout(std430, binding = 3) buffer ForceBuffer { Force forces[]; }; // 읽기/쓰기 모두 필요
+
+layout(push_constant) uniform PushConstants {
+    float dt;
+    float u_Time;
+    uint numWorkGroupsFromPreviousPass;
+    float youngsModulus;
+    float poissonsRatio;
+    uint colorOffset;
+    uint colorCount;
+} pc;
+
+
+void main() {
+    // 라메 상수(Lame Parameters)로 변환
+    float mu = pc.youngsModulus / (2.0 * (1.0 + pc.poissonsRatio));
+    float lambda = (pc.youngsModulus * pc.poissonsRatio) / ((1.0 + pc.poissonsRatio) * (1.0 - 2.0 * pc.poissonsRatio));
+    
+    if (gl_GlobalInvocationID.x >= pc.colorCount) return;
+    uint tIdx = gl_GlobalInvocationID.x + pc.colorOffset;
+
+    Tetrahedron tet = tetras[tIdx];
+
+    // 1. 4개 정점의 현재 위치 가져오기
+    uint i0 = tet.indices.x;
+    uint i1 = tet.indices.y;
+    uint i2 = tet.indices.z;
+    uint i3 = tet.indices.w;
+
+    vec3 x0 = physData[i0].pos;
+    vec3 x1 = physData[i1].pos;
+    vec3 x2 = physData[i2].pos;
+    vec3 x3 = physData[i3].pos;
+
+    // 2. 변형된 상태 행렬 (Ds) 계산
+    mat3 Ds = mat3(x1 - x0, x2 - x0, x3 - x0); // Column-major 방식
+
+    // 3. 역행렬 (Dm^-1) 복구
+    mat3 invDm = mat3(
+        tet.invDm[0], tet.invDm[1], tet.invDm[2],
+        tet.invDm[3], tet.invDm[4], tet.invDm[5],
+        tet.invDm[6], tet.invDm[7], tet.invDm[8]
+    );
+
+    // 4. 변형 기울기 (Deformation Gradient, F)
+    mat3 F = Ds * invDm;
+
+    // 5. 제1 피올라-키르히호프 응력 텐서 (P) - Neo-Hookean 모델
+    mat3 I = mat3(1.0); // 3x3 단위 행렬
+    float J = determinant(F);
+    if (isnan(J) || isinf(J) || J < 0.0001) {
+        F[0][0] += 0.001;
+        F[1][1] += 0.001;
+        F[2][2] += 0.001;
+        J = determinant(F);
+    }
+    float J_safe = max(J, 0.001);
+
+    mat3 invF = inverse(F);
+    mat3 invFT = transpose(invF);
+
+    mat3 P = mu * (F - invFT) + lambda * log(J_safe) * invFT;
+    
+    // 6. 정점에 가해지는 힘 행렬 (H) 계산
+    mat3 H = -tet.restVolume * P * transpose(invDm);
+    // H = mat3(0.0);
+
+    // 7. 각 정점별 힘 추출 (H의 열 벡터들)
+    vec3 f1 = H[0];
+    vec3 f2 = H[1];
+    vec3 f3 = H[2];
+    vec3 f0 = -(f1 + f2 + f3); // 작용-반작용의 법칙 (총합은 0)
+
+    forces[i0].force += f0;
+    forces[i1].force += f1;
+    forces[i2].force += f2;
+    forces[i3].force += f3;
+}

@@ -1,0 +1,38 @@
+#version 450
+
+// 워크그룹 사이즈 세팅
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ==========================================
+// 1. 데이터 구조체 정의
+// ==========================================
+struct PhysicsVertex {
+    vec3 pos;       // 현재 Newton 위치 (x_k)
+    float invMass;
+    vec3 vel;       // 현재 Newton 속도 (v_k)
+    float padding;
+    vec3 pos_n;     // 이전 타임스텝 위치 (x^n)
+    float padding2;
+    vec3 vel_n;     // 이전 타임스텝 속도 (v^n)
+    float padding3;
+    vec4 normal;
+};
+
+// ==========================================
+// 2. 버퍼 바인딩
+// ==========================================
+layout(std430, binding = 0) buffer PhysicsIn { PhysicsVertex physData[]; };
+
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx < physData.length()) {
+        float invM = physData[idx].invMass;
+
+        if (invM > 0.0) {
+            physData[idx].pos_n = physData[idx].pos;
+            physData[idx].vel_n = physData[idx].vel;
+        }
+    }
+}
